@@ -66,6 +66,22 @@ whatsapp-localmind config set-identity --name "张工" --phone-suffix "8888"
 whatsapp-localmind config block "1203630xxx@g.us"
 ```
 
+### 7. 清理导出媒体缓存与本地快照 (`clean`)
+清理导出的媒体缓存或销毁本地 SQLite 快照文件：
+```bash
+# 仅清理 snapshot/media/ 下导出的媒体文件，保留 SQLite 快照
+whatsapp-localmind clean --media-only --format json
+
+# 同时删除导出的媒体缓存与本地 SQLite 快照文件（默认 --all）
+whatsapp-localmind clean --all --format json
+```
+
+### 8. 启动只读 MCP Stdio Server (`mcp-serve`)
+通过标准输入输出（Stdio）启动只读 Model Context Protocol (MCP) Server：
+```bash
+whatsapp-localmind mcp-serve [--config <config.json>]
+```
+
 ---
 
 ## 标准流与退出码契约
