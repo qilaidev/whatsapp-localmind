@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Standalone & repo-aware CLI wrapper inside skills/whatsapp-localmind/scripts/whatsapp-localmind."""
+
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CANDIDATE_SRC_DIRS = [
+    SCRIPT_DIR,  # Standalone skill bundle: scripts/wa_localmind/
+    SCRIPT_DIR.parent.parent.parent / "src",  # Inside project repo: <repo>/src/
+]
+
+for cand in CANDIDATE_SRC_DIRS:
+    if (cand / "wa_localmind" / "__init__.py").exists():
+        if str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
+        break
+
+from wa_localmind.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

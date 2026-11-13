@@ -1,0 +1,93 @@
+# WhatsApp LocalMind
+
+> Zero-dependency macOS WhatsApp local group chat read-only extractor, structured cleaner, CLI, and JSON-RPC 2.0 MCP Stdio Server for AI Agents. Reads CoreData SQLite databases (`ChatStorage.sqlite`, `LID.sqlite`, `ContactsV2.sqlite`) via `sqlite3_backup` + POSIX `flock` snapshots with `?mode=ro`, physically blocking 1-on-1 DMs (`@s.whatsapp.net` / `@lid`) and enforcing `@g.us` group-only isolation.
+
+## Canonical Links
+
+- Repository: https://github.com/qilaidev/whatsapp-localmind
+- English Documentation: https://github.com/qilaidev/whatsapp-localmind/blob/main/README.en.md
+- Chinese Documentation: https://github.com/qilaidev/whatsapp-localmind/blob/main/README.md
+- Agent Skill Definition: https://github.com/qilaidev/whatsapp-localmind/blob/main/skills/whatsapp-localmind/SKILL.md
+- Security Policy: https://github.com/qilaidev/whatsapp-localmind/blob/main/SECURITY.md
+- Contributing Guide: https://github.com/qilaidev/whatsapp-localmind/blob/main/CONTRIBUTING.md
+- License (MIT): https://github.com/qilaidev/whatsapp-localmind/blob/main/LICENSE
+- Sister Project (WeChat): https://github.com/qilaidev/wechat-localmind
+
+## CLI Subcommands (9)
+
+- `whatsapp-localmind doctor [--format json|md]` — Check macOS Full Disk Access (TCC), WhatsApp CoreData DB readability, latest message timestamp, and `global_latest_msg_id`.
+- `whatsapp-localmind config <show|set-identity|set-mode|block|unblock|allow|unallow>` — Manage self identity anchor (`--name`, `--phone-suffix`) and group blacklist/whitelist rules.
+- `whatsapp-localmind groups [--keyword STR] [--include-blocked] [--format json|md] [--fresh]` (alias: `list-groups`) — List accessible `@g.us` group chats, member counts, 24h message counts, and `latest_msg_id` cursors.
+- `whatsapp-localmind fetch --chats <JIDs|ALL_ALLOWED> [--after-id INT | --since STR] [--until STR] [--context-buffer INT] [--limit INT] [--no-fold-noise] [--format md|json] [--fresh]` — Fetch cleaned group messages with 4-tier real-name resolution, `@lid` bridging, 150-char Protobuf reply chains, revoked message filtering, and 10-message context buffer.
+- `whatsapp-localmind search --query STR [--chats JIDs|ALL_ALLOWED] [--since STR] [--context INT] [--limit INT] [--format md|json] [--fresh]` — Search keyword across allowed groups with +/- N surrounding context messages.
+- `whatsapp-localmind export-media --msg-ids <ID1,ID2,...> [--format json|md]` — Export sandboxed group media (`.opus`, `.pdf`, `.xlsx`, images) by `msg_id` to `snapshot/media` and return absolute file paths.
+- `whatsapp-localmind clean [--media-only | --snapshot-only]` — Clean exported media cache or destroy local SQLite snapshot files.
+- `whatsapp-localmind mcp-serve` — Start zero-dependency JSON-RPC 2.0 MCP Stdio Server.
+- `whatsapp-localmind install [--bin-dir PATH] [--skill-dir PATH]` — Symlink `whatsapp-localmind` CLI to `~/.local/bin` and optionally install `SKILL.md` bundle.
+
+## MCP Stdio Tools (4 Read-Only)
+
+- `whatsapp_list_groups(keyword?, include_blocked?, format?, fresh?)` — List accessible `@g.us` group chats and cursors.
+- `whatsapp_fetch_messages(chat_ids, after_msg_id?, since?, until?, context_buffer?, limit_per_chat?, fold_noise?, format?, fresh?)` — Fetch cleaned group messages by monotonic cursor (`Z_PK`) or time window.
+- `whatsapp_search_messages(query, chat_ids?, since?, context?, limit?, format?)` — Search allowed group messages and attachment titles with context window.
+- `whatsapp_export_media(msg_ids)` — Export local group media attachments by `msg_id` and return absolute paths.
+
+## POSIX Exit Codes
+
+- `0` (`EXIT_SUCCESS`): Command succeeded.
+- `1` (`EXIT_USAGE_ERROR`): Invalid CLI arguments or time expression.
+- `2` (`EXIT_ENV_OR_PERM_ERROR`): WhatsApp CoreData DB missing or macOS Full Disk Access (TCC) denied.
+- `3` (`EXIT_POLICY_DENIED`): Blocked by `@g.us` group-only isolation or blacklist/whitelist policy.
+- `4` (`EXIT_RESOURCE_NOT_FOUND`): Target `chat_id`, `msg_id`, or local media file not found.
+- `5` (`EXIT_INTERNAL_DB_ERROR`): SQLite snapshot backup or read query error.
+
+## JSON Output Schema (`fetch`)
+
+```json
+{
+  "meta": {
+    "extracted_at": "ISO-8601",
+    "snapshot_time": "ISO-8601",
+    "snapshot_age_sec": 0,
+    "query_mode": "after_id | since",
+    "request_after_msg_id": 1500,
+    "global_latest_msg_id": 1520,
+    "my_identity": "string",
+    "warnings": []
+  },
+  "chats": [
+    {
+      "chat_id": "120363000000000001@g.us",
+      "group_name": "string",
+      "chat_min_msg_id": 1501,
+      "chat_latest_msg_id": 1520,
+      "new_message_count": 10,
+      "context_buffer_count": 10,
+      "has_more": false,
+      "messages": [
+        {
+          "msg_id": 1501,
+          "stanza_id": "string",
+          "timestamp": "ISO-8601",
+          "timestamp_epoch": 1700000000,
+          "sender_jid": "string",
+          "sender_name": "string",
+          "is_from_me": false,
+          "is_context_buffer": false,
+          "is_ack_noise": false,
+          "msg_type": "text | image | video | audio | document | ...",
+          "text": "string",
+          "mentions_me": false,
+          "reply_to": {"msg_id": 1500, "stanza_id": "...", "sender_name": "...", "snippet": "..."},
+          "media": {"local_available": true, "relative_path": "...", "filename": "...", "size_bytes": 1234}
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Environment Variables
+
+- `WHATSAPP_LOCALMIND_CONTAINER_DIR`: Override WhatsApp Group Container directory path.
+- `WHATSAPP_LOCALMIND_SNAPSHOT_DIR`: Override local read-only snapshot and exported media cache directory path.

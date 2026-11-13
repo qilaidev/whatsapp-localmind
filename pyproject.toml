@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whatsapp-localmind"
+version = "3.2.0"
+description = "Zero-dependency macOS WhatsApp local group chat read-only extractor, structured cleaner, CLI & MCP Server for AI Agents"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = []
+authors = [
+    {name = "qilaidev"}
+]
+keywords = [
+    "whatsapp",
+    "mcp-server",
+    "ai-agent",
+    "cli",
+    "macos",
+    "sqlite",
+    "local-first",
+    "privacy",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/qilaidev/whatsapp-localmind"
+Repository = "https://github.com/qilaidev/whatsapp-localmind"
+Issues = "https://github.com/qilaidev/whatsapp-localmind/issues"
+
+[project.scripts]
+whatsapp-localmind = "wa_localmind.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

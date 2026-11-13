@@ -1,0 +1,31 @@
+# Environment & secrets
+.env*
+!.env.example
+*.pem
+*.key
+*.session*
+tdata/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments & test caches
+.venv/
+venv/
+ENV/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Local runtime cache / snapshots / databases
+*.sqlite*
+*.db*
