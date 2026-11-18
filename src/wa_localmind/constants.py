@@ -33,6 +33,10 @@ DEFAULT_SNAPSHOT_META_PATH = DEFAULT_SNAPSHOT_DIR / "snapshot_meta.json"
 DEFAULT_SNAPSHOT_LOCK_PATH = DEFAULT_SNAPSHOT_DIR / "snapshot.lock"
 DEFAULT_EXPORT_MEDIA_DIR = DEFAULT_SNAPSHOT_DIR / "media"
 
+# Session scopes & normalized chat types
+VALID_CHAT_SCOPES = ("all", "groups", "direct", "newsletter")
+VALID_CHAT_TYPES = ("all", "group", "direct", "newsletter", "broadcast")
+
 # WhatsApp ZWAMESSAGE.ZMESSAGETYPE Enum Mapping
 MSG_TYPE_MAP = {
     0: "text",

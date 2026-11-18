@@ -1,3 +1,3 @@
-"""WhatsApp-LocalMind: macOS WhatsApp Local Data Extraction Capability Layer (CLI & MCP)."""
+"""WhatsApp-LocalMind: macOS WhatsApp Local Chat Data Extraction Capability Layer (CLI & MCP)."""
 
-__version__ = "3.2.0"
+__version__ = "4.0.0"

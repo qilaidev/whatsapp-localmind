@@ -1,4 +1,4 @@
-"""Read-only SQLite query engine, universal @lid/phone name resolver, and message pipeline."""
+"""Read-only SQLite query engine, universal @lid/phone name resolver, and full-account message pipeline."""
 
 from __future__ import annotations
 
@@ -14,12 +14,13 @@ from .cleaner import (
     clean_unicode_display_name,
     disambiguate_punctuation_name,
     format_fallback_sender_name,
+    is_my_jid_prefix,
     is_short_ack_noise,
     replace_mentions_with_whitelist,
     strip_jid_Namespace,
     truncate_reply_snippet,
 )
-from .config import AppConfig
+from .config import AppConfig, classify_wa_jid
 from .constants import (
     APPLE_EPOCH_OFFSET,
     DEFAULT_FETCH_LIMIT,
@@ -28,8 +29,10 @@ from .constants import (
     MEDIA_MSG_TYPES,
     MSG_TYPE_MAP,
     SYNC_LAG_WARNING_SEC,
+    VALID_CHAT_TYPES,
 )
 from .errors import ResourceNotFoundError, UsageError
+from .media import resolve_safe_wa_sandbox_path
 from .protobuf_parser import (
     decode_groupmember_firstname_proto,
     is_base64_protocol_token,
@@ -38,6 +41,7 @@ from .protobuf_parser import (
 from .snapshot import SnapshotState, epoch_to_local_iso, make_ro_sqlite_uri
 
 DURATION_RE = re.compile(r"^(\d+)\s*([smhdw])$", re.IGNORECASE)
+PHONE_DIGITS_RE = re.compile(r"^\+?\d{6,20}$")
 SELF_PARTNER_LABELS = frozenset({"你", "You", "Yourself", "Tú", "Vous", "Du"})
 
 
@@ -67,18 +71,33 @@ def parse_since_to_epoch(since_str: str | None, now_epoch: float | None = None) 
         ) from exc
 
 
+def normalize_chat_type_filter(chat_type: str | None) -> str:
+    if not chat_type:
+        return "all"
+    ct = chat_type.strip().lower()
+    if ct == "groups":
+        ct = "group"
+    if ct not in VALID_CHAT_TYPES:
+        raise UsageError(
+            f"Invalid chat type filter '{chat_type}'. Expected one of {VALID_CHAT_TYPES}."
+        )
+    return ct
+
+
 class QueryEngine:
-    """Executes read-only queries against the atomic SQLite snapshot with dynamic schema adaptation."""
+    """Executes read-only queries against the atomic SQLite snapshot across all WhatsApp chat sessions."""
 
     def __init__(self, config: AppConfig, snapshot: SnapshotState) -> None:
         self.config = config
         self.snapshot = snapshot
-        self.wa_message_dir = Path(os.path.expanduser(config.wa_container_dir)) / "Message"
+        self.wa_message_dir = (Path(os.path.expanduser(config.wa_container_dir)) / "Message").resolve()
         self._conn: sqlite3.Connection | None = None
         self._table_cols_cache: dict[str, set[str]] = {}
         self._jid_name_map: dict[str, str] | None = None
+        self._resolved_real_names: dict[str, str] = {}
         self._jid_prefix_map: dict[str, str] | None = None
         self._lid_to_phone_jid: dict[str, str] = {}
+        self._phone_to_lid_jid: dict[str, str] = {}
         self._auto_self_prefixes: set[str] = set()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -103,6 +122,12 @@ class QueryEngine:
         if "ZDURATION" in cols:
             return f"{alias}.ZDURATION AS ZMOVIEDURATION"
         return "0 AS ZMOVIEDURATION"
+
+    def _from_jid_expr(self, alias: str = "m") -> str:
+        cols = self._get_table_columns("ZWAMESSAGE")
+        if "ZFROMJID" in cols:
+            return f"{alias}.ZFROMJID AS ZFROMJID"
+        return "NULL AS ZFROMJID"
 
     def close(self) -> None:
         if self._conn is not None:
@@ -187,8 +212,10 @@ class QueryEngine:
             if jid.endswith("@lid") and ident.endswith("@s.whatsapp.net"):
                 lid_to_phone[jid] = ident
                 phone_to_lid[ident] = jid
+            elif jid.endswith("@s.whatsapp.net") and ident.endswith("@lid"):
+                phone_to_lid[jid] = ident
+                lid_to_phone[ident] = jid
 
-            # Auto-detect self session ("你" / "You")
             if pname in SELF_PARTNER_LABELS:
                 for self_jid in (jid, ident):
                     p = strip_jid_Namespace(self_jid)
@@ -196,7 +223,7 @@ class QueryEngine:
                         auto_self.add(p)
                 continue
 
-            if pname and not pname.startswith("+") and pname.lower() != "whatsapp":
+            if pname and not pname.startswith("+") and pname.lower() != "whatsapp" and not is_base64_protocol_token(pname):
                 tier1_remark[jid] = pname
                 if ident:
                     tier1_remark[ident] = pname
@@ -262,20 +289,26 @@ class QueryEngine:
                 if decoded_fn and not decoded_fn.startswith("+"):
                     tier3_member[jid] = decoded_fn
 
-        # 3b. Load ZWAMESSAGE.ZPUSHNAME ONLY when it is a genuine human string (not a base64 protocol token)
+        # 3b. Load ZWAMESSAGE.ZPUSHNAME from group & 1-on-1 messages when genuine human string
+        msg_cols = self._get_table_columns("ZWAMESSAGE")
+        from_sel = "m.ZFROMJID" if "ZFROMJID" in msg_cols else "NULL"
         cur.execute(
-            """
-            SELECT gm.ZMEMBERJID AS jid, m.ZPUSHNAME AS pushname
+            f"""
+            SELECT COALESCE(gm.ZMEMBERJID, {from_sel}, s.ZCONTACTJID) AS jid, m.ZPUSHNAME AS pushname
             FROM ZWAMESSAGE m
-            JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
-            WHERE gm.ZMEMBERJID IS NOT NULL
+            LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+            LEFT JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+            WHERE COALESCE(m.ZISFROMME, 0) = 0
               AND m.ZPUSHNAME IS NOT NULL
               AND TRIM(m.ZPUSHNAME) != ''
+              AND (gm.ZMEMBERJID IS NOT NULL OR s.ZCONTACTJID NOT LIKE '%@g.us')
             ORDER BY m.Z_PK ASC
             """
         )
         for row in cur.fetchall():
-            jid = row["jid"].strip()
+            jid = (row["jid"] or "").strip()
+            if not jid or jid.endswith("@g.us"):
+                continue
             raw_pn = row["pushname"].strip()
             if not is_base64_protocol_token(raw_pn):
                 clean_pn = clean_unicode_display_name(raw_pn)
@@ -298,6 +331,7 @@ class QueryEngine:
             | set(phone_to_lid.keys())
         )
         merged: dict[str, str] = {}
+        resolved_real: dict[str, str] = {}
         for jid in all_jids:
             bridged_phone = lid_to_phone.get(jid)
             raw_name = (
@@ -307,6 +341,7 @@ class QueryEngine:
             )
             if raw_name:
                 name = disambiguate_punctuation_name(raw_name, jid, bridged_phone)
+                resolved_real[jid] = name
             else:
                 name = format_fallback_sender_name(jid, bridged_phone)
             merged[jid] = name
@@ -318,57 +353,110 @@ class QueryEngine:
                 prefix_map[prefix] = name
 
         self._lid_to_phone_jid = lid_to_phone
+        self._phone_to_lid_jid = phone_to_lid
         self._auto_self_prefixes = auto_self
         self._jid_name_map = merged
+        self._resolved_real_names = resolved_real
         self._jid_prefix_map = prefix_map
         return merged, prefix_map
+
+    def _bridged_alt_jid(self, chat_id: str) -> str | None:
+        self._ensure_name_maps()
+        return self._lid_to_phone_jid.get(chat_id) or self._phone_to_lid_jid.get(chat_id)
+
+    def resolve_chat_name(self, chat_id: str, raw_partner_name: str | None) -> str:
+        """Resolve display title for any WhatsApp session (group, 1-on-1 direct, self, newsletter)."""
+        ctype = classify_wa_jid(chat_id)
+        pname = clean_unicode_display_name(raw_partner_name)
+        self._ensure_name_maps()
+
+        if pname in SELF_PARTNER_LABELS or is_my_jid_prefix(
+            strip_jid_Namespace(chat_id), self.config, self._auto_self_prefixes
+        ):
+            return f"{self.config.my_display_label}" if pname in SELF_PARTNER_LABELS else (pname or self.config.my_display_label)
+
+        if ctype == "group":
+            return pname or "未命名群聊"
+        if ctype == "newsletter":
+            return pname or "未命名频道"
+        if ctype == "broadcast":
+            return pname or "广播列表"
+
+        if chat_id in self._resolved_real_names:
+            return self._resolved_real_names[chat_id]
+        if pname and not is_base64_protocol_token(pname):
+            return disambiguate_punctuation_name(pname, chat_id, self._lid_to_phone_jid.get(chat_id))
+        return format_fallback_sender_name(chat_id, self._lid_to_phone_jid.get(chat_id))
 
     def resolve_sender_name(
         self,
         is_from_me: bool,
         member_jid: str | None,
         msg_pushname: str | None,
+        fallback_partner_name: str | None = None,
     ) -> str:
         if is_from_me:
             return self.config.my_display_label
-        jid_map, _ = self._ensure_name_maps()
-        if member_jid and member_jid in jid_map:
-            return jid_map[member_jid]
+        self._ensure_name_maps()
+        if member_jid and member_jid in self._resolved_real_names:
+            return self._resolved_real_names[member_jid]
         if msg_pushname and not is_base64_protocol_token(msg_pushname):
             clean_pn = clean_unicode_display_name(msg_pushname)
             if clean_pn:
-                return clean_pn
+                return disambiguate_punctuation_name(
+                    clean_pn,
+                    member_jid,
+                    self._lid_to_phone_jid.get(member_jid or ""),
+                )
+        if fallback_partner_name and not is_base64_protocol_token(fallback_partner_name):
+            clean_fp = clean_unicode_display_name(fallback_partner_name)
+            if clean_fp and clean_fp not in SELF_PARTNER_LABELS:
+                return disambiguate_punctuation_name(
+                    clean_fp,
+                    member_jid,
+                    self._lid_to_phone_jid.get(member_jid or ""),
+                )
         bridged_phone = self._lid_to_phone_jid.get(member_jid or "")
         return format_fallback_sender_name(member_jid, bridged_phone)
 
-    def get_group_member_prefix_dict(self, chat_session_pk: int) -> dict[str, str]:
-        """Return {jid_numeric_prefix: resolved_name} for a specific group session (plus global known JIDs)."""
+    def get_session_member_prefix_dict(self, chat_session_pk: int, chat_id: str) -> dict[str, str]:
+        """Return {jid_numeric_prefix: resolved_name} for a session (plus global known JIDs)."""
         jid_map, global_prefix_map = self._ensure_name_maps()
         member_dict = dict(global_prefix_map)
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT ZMEMBERJID
-            FROM ZWAGROUPMEMBER
-            WHERE ZCHATSESSION = ? AND ZMEMBERJID IS NOT NULL
-            """,
-            (chat_session_pk,),
-        )
-        for row in cur.fetchall():
-            jid = row["ZMEMBERJID"]
-            prefix = strip_jid_Namespace(jid)
+        if classify_wa_jid(chat_id) == "group":
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT ZMEMBERJID
+                FROM ZWAGROUPMEMBER
+                WHERE ZCHATSESSION = ? AND ZMEMBERJID IS NOT NULL
+                """,
+                (chat_session_pk,),
+            )
+            for row in cur.fetchall():
+                jid = row["ZMEMBERJID"]
+                prefix = strip_jid_Namespace(jid)
+                if prefix and prefix not in member_dict:
+                    bridged_phone = self._lid_to_phone_jid.get(jid)
+                    member_dict[prefix] = jid_map.get(jid) or format_fallback_sender_name(jid, bridged_phone)
+        else:
+            prefix = strip_jid_Namespace(chat_id)
             if prefix and prefix not in member_dict:
-                bridged_phone = self._lid_to_phone_jid.get(jid)
-                member_dict[prefix] = jid_map.get(jid) or format_fallback_sender_name(jid, bridged_phone)
+                bridged_phone = self._lid_to_phone_jid.get(chat_id)
+                member_dict[prefix] = jid_map.get(chat_id) or format_fallback_sender_name(chat_id, bridged_phone)
         return member_dict
 
-    def list_groups(
+    def list_chats(
         self,
         keyword: str | None = None,
         include_blocked: bool = False,
+        chat_type: str = "all",
     ) -> dict[str, Any]:
-        """List group sessions with latest cursor, 24h message counts, and policy status."""
+        """List WhatsApp chat sessions (1-on-1 direct, groups, newsletters) with cursors and 24h counts."""
+        type_filter = normalize_chat_type_filter(chat_type)
+        self._ensure_name_maps()
+
         conn = self._get_conn()
         cur = conn.cursor()
         now_apple = time.time() - APPLE_EPOCH_OFFSET
@@ -376,22 +464,25 @@ class QueryEngine:
 
         cs_cols = self._get_table_columns("ZWACHATSESSION")
         removed_filter = "AND COALESCE(s.ZREMOVED, 0) = 0" if "ZREMOVED" in cs_cols else ""
+        ident_expr = "s.ZCONTACTIDENTIFIER AS contact_ident" if "ZCONTACTIDENTIFIER" in cs_cols else "NULL AS contact_ident"
         placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
         sql = f"""
             SELECT
                 s.Z_PK AS session_pk,
                 s.ZCONTACTJID AS chat_id,
-                COALESCE(s.ZPARTNERNAME, '未命名群聊') AS group_name,
+                {ident_expr},
+                s.ZPARTNERNAME AS partner_name,
                 s.ZLASTMESSAGEDATE AS session_last_date,
                 COALESCE(MAX(m.Z_PK), 0) AS latest_msg_id,
                 MAX(m.ZMESSAGEDATE) AS latest_msg_date,
                 SUM(CASE WHEN m.ZMESSAGEDATE >= ? THEN 1 ELSE 0 END) AS msg_count_24h,
-                (SELECT COUNT(*) FROM ZWAGROUPMEMBER gm WHERE gm.ZCHATSESSION = s.Z_PK AND COALESCE(gm.ZISACTIVE, 1) = 1) AS member_count
+                (SELECT COUNT(*) FROM ZWAGROUPMEMBER gm WHERE gm.ZCHATSESSION = s.Z_PK AND COALESCE(gm.ZISACTIVE, 1) = 1) AS group_member_count
             FROM ZWACHATSESSION s
             LEFT JOIN ZWAMESSAGE m
                 ON m.ZCHATSESSION = s.Z_PK
                 AND m.ZMESSAGETYPE NOT IN ({placeholders})
-            WHERE s.ZCONTACTJID LIKE '%@g.us'
+            WHERE s.ZCONTACTJID IS NOT NULL
+              AND s.ZCONTACTJID != 'status@broadcast'
               {removed_filter}
             GROUP BY s.Z_PK
             ORDER BY COALESCE(MAX(m.ZMESSAGEDATE), s.ZLASTMESSAGEDATE, 0) DESC
@@ -399,31 +490,53 @@ class QueryEngine:
         params: list[Any] = [since_24h_apple, *EXCLUDED_MSG_TYPES]
         cur.execute(sql, params)
 
-        groups: list[dict[str, Any]] = []
+        chats: list[dict[str, Any]] = []
         kw_lower = keyword.strip().lower() if keyword else None
 
         for row in cur.fetchall():
-            chat_id = row["chat_id"]
-            group_name = clean_unicode_display_name(row["group_name"]) or "未命名群聊"
-            if kw_lower and kw_lower not in group_name.lower() and kw_lower not in chat_id.lower():
+            chat_id = (row["chat_id"] or "").strip()
+            ctype = classify_wa_jid(chat_id)
+            if ctype in ("unknown", "status"):
+                continue
+            if type_filter != "all" and ctype != type_filter:
                 continue
 
-            allowed = self.config.is_chat_allowed(chat_id)
+            chat_name = self.resolve_chat_name(chat_id, row["partner_name"])
+            alt_jid = (row["contact_ident"] or "").strip() or self._bridged_alt_jid(chat_id)
+            if kw_lower:
+                haystack = f"{chat_name} {chat_id} {alt_jid or ''}".lower()
+                if kw_lower not in haystack:
+                    continue
+
+            allowed = self.config.is_chat_allowed(chat_id, bridged_alt_jid=alt_jid)
             if not allowed and not include_blocked:
                 continue
 
             last_apple = row["latest_msg_date"] if row["latest_msg_date"] is not None else row["session_last_date"]
             last_epoch = int(round(float(last_apple) + APPLE_EPOCH_OFFSET)) if last_apple is not None else None
 
-            groups.append(
+            if ctype == "group":
+                member_count = int(row["group_member_count"] or 0)
+            elif ctype == "direct":
+                is_self_chat = (
+                    clean_unicode_display_name(row["partner_name"]) in SELF_PARTNER_LABELS
+                    or is_my_jid_prefix(strip_jid_Namespace(chat_id), self.config, self._auto_self_prefixes)
+                )
+                member_count = 1 if is_self_chat else 2
+            else:
+                member_count = 0
+
+            chats.append(
                 {
                     "chat_id": chat_id,
-                    "group_name": group_name,
+                    "chat_name": chat_name,
+                    "group_name": chat_name,
+                    "chat_type": ctype,
                     "allowed": allowed,
                     "latest_msg_id": int(row["latest_msg_id"] or 0),
                     "last_active_time": epoch_to_local_iso(last_epoch),
                     "msg_count_24h": int(row["msg_count_24h"] or 0),
-                    "member_count": int(row["member_count"] or 0),
+                    "member_count": member_count,
                 }
             )
 
@@ -433,58 +546,141 @@ class QueryEngine:
                 "snapshot_age_sec": self.snapshot.snapshot_age_sec,
                 "db_latest_msg_time": self.snapshot.db_latest_msg_time_iso,
                 "global_latest_msg_id": self.snapshot.global_latest_msg_id,
+                "chat_scope": self.config.chat_scope,
+                "chat_type_filter": type_filter,
                 "filter_mode": self.config.filter_mode,
                 "warnings": self.build_common_warnings(),
             },
-            "groups": groups,
+            "chats": chats,
         }
 
-    def _resolve_target_sessions(self, chat_ids: list[str]) -> list[sqlite3.Row]:
-        """Validate requested chat_ids against session isolation policy and return ZWACHATSESSION rows."""
+    def list_groups(
+        self,
+        keyword: str | None = None,
+        include_blocked: bool = False,
+    ) -> dict[str, Any]:
+        """Backward-compatible helper listing group chats (@g.us) with `groups` and `chats` keys."""
+        res = self.list_chats(keyword=keyword, include_blocked=include_blocked, chat_type="group")
+        res["groups"] = res["chats"]
+        return res
+
+    def _resolve_target_sessions(self, chat_ids: list[str], chat_type: str = "all") -> list[dict[str, Any]]:
+        """Validate requested chat_ids against session policy and return normalized session dicts."""
         if not chat_ids:
-            raise UsageError("At least one chat_id or 'ALL_ALLOWED' must be specified via --chats.")
+            raise UsageError(
+                "At least one chat_id or 'ALL_ALLOWED' / 'ALL_GROUPS' / 'ALL_DIRECT' must be specified via --chats."
+            )
+
+        type_filter = normalize_chat_type_filter(chat_type)
+        self._ensure_name_maps()
 
         conn = self._get_conn()
         cur = conn.cursor()
         cs_cols = self._get_table_columns("ZWACHATSESSION")
         removed_filter = "AND COALESCE(ZREMOVED, 0) = 0" if "ZREMOVED" in cs_cols else ""
+        ident_expr = "ZCONTACTIDENTIFIER AS contact_ident" if "ZCONTACTIDENTIFIER" in cs_cols else "NULL AS contact_ident"
 
-        if len(chat_ids) == 1 and chat_ids[0].upper() == "ALL_ALLOWED":
+        upper_single = chat_ids[0].strip().upper() if len(chat_ids) == 1 else ""
+        if upper_single in ("ALL_ALLOWED", "ALL", "ALL_GROUPS", "ALL_DIRECT"):
+            effective_type = type_filter
+            if upper_single == "ALL_GROUPS":
+                effective_type = "group"
+            elif upper_single == "ALL_DIRECT":
+                effective_type = "direct"
+
             cur.execute(
                 f"""
-                SELECT Z_PK AS session_pk, ZCONTACTJID AS chat_id, COALESCE(ZPARTNERNAME, '未命名群聊') AS group_name
+                SELECT Z_PK AS session_pk, ZCONTACTJID AS chat_id, {ident_expr}, ZPARTNERNAME AS partner_name
                 FROM ZWACHATSESSION
-                WHERE ZCONTACTJID LIKE '%@g.us' {removed_filter}
+                WHERE ZCONTACTJID IS NOT NULL AND ZCONTACTJID != 'status@broadcast' {removed_filter}
                 ORDER BY COALESCE(ZLASTMESSAGEDATE, 0) DESC
                 """
             )
-            return [r for r in cur.fetchall() if self.config.is_chat_allowed(r["chat_id"])]
+            out_all: list[dict[str, Any]] = []
+            for r in cur.fetchall():
+                cid = (r["chat_id"] or "").strip()
+                ctype = classify_wa_jid(cid)
+                if effective_type != "all" and ctype != effective_type:
+                    continue
+                alt_jid = (r["contact_ident"] or "").strip() or self._bridged_alt_jid(cid)
+                if not self.config.is_chat_allowed(cid, bridged_alt_jid=alt_jid):
+                    continue
+                out_all.append(
+                    {
+                        "session_pk": int(r["session_pk"]),
+                        "chat_id": cid,
+                        "chat_type": ctype,
+                        "partner_name": r["partner_name"],
+                        "chat_name": self.resolve_chat_name(cid, r["partner_name"]),
+                    }
+                )
+            return out_all
 
-        for cid in chat_ids:
-            self.config.assert_chat_allowed(cid)
+        # Explicit chat_ids (supports full JIDs, bridged @lid <-> @s.whatsapp.net JIDs, or bare phone digits)
+        normalized_inputs: list[str] = []
+        for raw_cid in chat_ids:
+            cid = raw_cid.strip()
+            if "@" not in cid and PHONE_DIGITS_RE.match(cid):
+                cid = f"{cid.lstrip('+')}@s.whatsapp.net"
+            normalized_inputs.append(cid)
 
-        placeholders = ",".join("?" for _ in chat_ids)
         cur.execute(
             f"""
-            SELECT Z_PK AS session_pk, ZCONTACTJID AS chat_id, COALESCE(ZPARTNERNAME, '未命名群聊') AS group_name
+            SELECT Z_PK AS session_pk, ZCONTACTJID AS chat_id, {ident_expr}, ZPARTNERNAME AS partner_name
             FROM ZWACHATSESSION
-            WHERE ZCONTACTJID IN ({placeholders}) AND ZCONTACTJID LIKE '%@g.us'
-            """,
-            chat_ids,
+            WHERE ZCONTACTJID IS NOT NULL
+            """
         )
-        rows_by_id = {r["chat_id"]: r for r in cur.fetchall()}
-        result: list[sqlite3.Row] = []
-        for cid in chat_ids:
-            if cid not in rows_by_id:
+        by_jid: dict[str, sqlite3.Row] = {}
+        for r in cur.fetchall():
+            cid = (r["chat_id"] or "").strip()
+            if cid:
+                by_jid[cid] = r
+            c_ident = (r["contact_ident"] or "").strip()
+            if c_ident and c_ident not in by_jid:
+                by_jid[c_ident] = r
+
+        result: list[dict[str, Any]] = []
+        seen_pks: set[int] = set()
+        for req_cid in normalized_inputs:
+            alt_req = self._bridged_alt_jid(req_cid)
+            # Enforce policy first so blocked/out-of-scope requests always raise Exit Code 3
+            self.config.assert_chat_allowed(req_cid, bridged_alt_jid=alt_req)
+
+            matched_row = by_jid.get(req_cid) or (by_jid.get(alt_req) if alt_req else None)
+            if matched_row is None:
                 raise ResourceNotFoundError(
-                    f"Group chat '{cid}' not found in local WhatsApp database.",
-                    error_code="GROUP_NOT_FOUND",
+                    f"WhatsApp chat '{req_cid}' not found in local database.",
+                    error_code="CHAT_NOT_FOUND",
                 )
-            result.append(rows_by_id[cid])
+
+            real_cid = (matched_row["chat_id"] or "").strip()
+            real_alt = (matched_row["contact_ident"] or "").strip() or self._bridged_alt_jid(real_cid)
+            self.config.assert_chat_allowed(real_cid, bridged_alt_jid=real_alt)
+
+            ctype = classify_wa_jid(real_cid)
+            if type_filter != "all" and ctype != type_filter:
+                continue
+
+            pk = int(matched_row["session_pk"])
+            if pk not in seen_pks:
+                seen_pks.add(pk)
+                result.append(
+                    {
+                        "session_pk": pk,
+                        "chat_id": real_cid,
+                        "chat_type": ctype,
+                        "partner_name": matched_row["partner_name"],
+                        "chat_name": self.resolve_chat_name(real_cid, matched_row["partner_name"]),
+                    }
+                )
         return result
 
     def _lookup_parent_reply(
         self,
+        session_pk: int,
+        chat_id: str,
+        partner_name: str | None,
         parent_pk: int | None,
         quoted_stanza_id: str | None,
         quoted_text_fallback: str | None,
@@ -495,33 +691,35 @@ class QueryEngine:
 
         conn = self._get_conn()
         cur = conn.cursor()
+        from_expr = self._from_jid_expr("m")
         row = None
         if parent_pk is not None:
             cur.execute(
-                """
+                f"""
                 SELECT m.Z_PK, m.ZMESSAGETYPE, m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME,
-                       gm.ZMEMBERJID, mi.ZTITLE, mi.ZAUTHORNAME
+                       {from_expr}, gm.ZMEMBERJID, mi.ZTITLE, mi.ZAUTHORNAME
                 FROM ZWAMESSAGE m
                 LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
                 LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
-                WHERE m.Z_PK = ?
+                WHERE m.Z_PK = ? AND m.ZCHATSESSION = ?
                 """,
-                (parent_pk,),
+                (parent_pk, session_pk),
             )
             row = cur.fetchone()
 
         if row is None and quoted_stanza_id:
+            # Security boundary: bind `m.ZCHATSESSION = ?` so spoofed quoted_stanza_id cannot leak across chats
             cur.execute(
-                """
+                f"""
                 SELECT m.Z_PK, m.ZMESSAGETYPE, m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME,
-                       gm.ZMEMBERJID, mi.ZTITLE, mi.ZAUTHORNAME
+                       {from_expr}, gm.ZMEMBERJID, mi.ZTITLE, mi.ZAUTHORNAME
                 FROM ZWAMESSAGE m
                 LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
                 LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
-                WHERE m.ZSTANZAID = ?
+                WHERE m.ZSTANZAID = ? AND m.ZCHATSESSION = ?
                 LIMIT 1
                 """,
-                (quoted_stanza_id,),
+                (quoted_stanza_id, session_pk),
             )
             row = cur.fetchone()
 
@@ -549,10 +747,19 @@ class QueryEngine:
 
         p_pk = int(row["Z_PK"])
         p_type = int(row["ZMESSAGETYPE"] or 0)
+        p_is_me = bool(row["ZISFROMME"])
+        ctype = classify_wa_jid(chat_id)
+        p_sender_jid = (
+            (row["ZMEMBERJID"] or "").strip()
+            or (row["ZFROMJID"] or "").strip()
+            or (chat_id if ctype != "group" else "")
+            or None
+        )
         p_sender = self.resolve_sender_name(
-            bool(row["ZISFROMME"]),
-            row["ZMEMBERJID"],
+            p_is_me,
+            p_sender_jid,
             row["ZPUSHNAME"],
+            fallback_partner_name=partner_name if ctype != "group" else None,
         )
 
         if p_type == 14:
@@ -583,6 +790,9 @@ class QueryEngine:
     def _transform_message_row(
         self,
         row: sqlite3.Row,
+        session_pk: int,
+        chat_id: str,
+        partner_name: str | None,
         member_dict: dict[str, str],
         is_context_buffer: bool,
     ) -> dict[str, Any] | None:
@@ -593,12 +803,27 @@ class QueryEngine:
 
         msg_type = MSG_TYPE_MAP.get(raw_type, f"unknown_{raw_type}")
         is_from_me = bool(row["ZISFROMME"])
-        member_jid = row["ZMEMBERJID"] if not is_from_me else "me"
-        sender_name = self.resolve_sender_name(is_from_me, row["ZMEMBERJID"], row["ZPUSHNAME"])
+        ctype = classify_wa_jid(chat_id)
+
+        if is_from_me:
+            sender_jid: str | None = "me"
+        else:
+            sender_jid = (
+                (row["ZMEMBERJID"] or "").strip()
+                or (row["ZFROMJID"] or "").strip()
+                or (chat_id if ctype != "group" else "")
+                or None
+            )
+
+        sender_name = self.resolve_sender_name(
+            is_from_me,
+            sender_jid,
+            row["ZPUSHNAME"],
+            fallback_partner_name=partner_name if ctype != "group" else None,
+        )
 
         proto_meta = parse_message_metadata_blob(row["ZMETADATA"])
 
-        # Add any mentioned JIDs from ZMETADATA into member_dict if not already present
         jid_map, _ = self._ensure_name_maps()
         for m_jid in proto_meta.mentioned_jids:
             m_prefix = strip_jid_Namespace(m_jid)
@@ -616,15 +841,20 @@ class QueryEngine:
         media_obj: dict[str, Any] | None = None
         if raw_type in MEDIA_MSG_TYPES or media_local_rel:
             local_available = False
+            within_sandbox = True
+            safe_disk_file: Path | None = None
             if media_local_rel:
-                full_media_path = self.wa_message_dir / media_local_rel
-                local_available = full_media_path.is_file() and full_media_path.stat().st_size > 0
+                safe_disk_file, within_sandbox = resolve_safe_wa_sandbox_path(media_local_rel, self.wa_message_dir)
+                local_available = within_sandbox and safe_disk_file is not None
+
+            if not within_sandbox:
+                media_filesize = None
 
             if raw_type == 8:  # Document
                 doc_title = (
                     media_author
                     or media_title
-                    or (os.path.basename(media_local_rel) if media_local_rel else "")
+                    or (os.path.basename(media_local_rel.replace("\\", "/")) if media_local_rel else "")
                     or raw_text
                     or "未命名文档"
                 )
@@ -632,7 +862,7 @@ class QueryEngine:
                     raw_text = media_title
             else:
                 doc_title = (
-                    (os.path.basename(media_local_rel) if media_local_rel else "")
+                    (os.path.basename(media_local_rel.replace("\\", "/")) if media_local_rel else "")
                     or media_author
                     or None
                 )
@@ -668,6 +898,9 @@ class QueryEngine:
         )
 
         reply_to = self._lookup_parent_reply(
+            session_pk,
+            chat_id,
+            partner_name,
             int(row["ZPARENTMESSAGE"]) if row["ZPARENTMESSAGE"] is not None else None,
             proto_meta.quoted_stanza_id,
             proto_meta.quoted_text_fallback,
@@ -688,7 +921,7 @@ class QueryEngine:
             "stanza_id": row["ZSTANZAID"],
             "timestamp": epoch_to_local_iso(msg_epoch),
             "timestamp_epoch": msg_epoch,
-            "sender_jid": member_jid,
+            "sender_jid": sender_jid,
             "sender_name": sender_name,
             "is_from_me": is_from_me,
             "is_context_buffer": is_context_buffer,
@@ -708,8 +941,9 @@ class QueryEngine:
         until_str: str | None = None,
         context_buffer_count: int | None = None,
         limit_per_chat: int = DEFAULT_FETCH_LIMIT,
+        chat_type: str = "all",
     ) -> dict[str, Any]:
-        """Fetch cleaned group messages by global cursor (--after-id) or time window (--since)."""
+        """Fetch cleaned WhatsApp messages across any allowed chat sessions by cursor or time window."""
         limit = max(1, min(int(limit_per_chat), MAX_FETCH_LIMIT))
         ctx_count = (
             self.config.cleaning.context_buffer_count
@@ -750,20 +984,26 @@ class QueryEngine:
         else:
             since_epoch = parse_since_to_epoch(since_str or "24h", now_epoch)
 
-        sessions = self._resolve_target_sessions(chat_ids)
-        is_explicit_single_or_multi = not (len(chat_ids) == 1 and chat_ids[0].upper() == "ALL_ALLOWED")
+        sessions = self._resolve_target_sessions(chat_ids, chat_type=chat_type)
+        is_wildcard = (
+            len(chat_ids) == 1
+            and chat_ids[0].strip().upper() in ("ALL_ALLOWED", "ALL", "ALL_GROUPS", "ALL_DIRECT")
+        )
 
         conn = self._get_conn()
         cur = conn.cursor()
         excl_placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
         dur_expr = self._media_duration_expr("mi")
+        from_expr = self._from_jid_expr("m")
 
         chats_result: list[dict[str, Any]] = []
 
         for sess in sessions:
             sess_pk = int(sess["session_pk"])
             chat_id = sess["chat_id"]
-            group_name = clean_unicode_display_name(sess["group_name"]) or "未命名群聊"
+            chat_name = sess["chat_name"]
+            sess_type = sess["chat_type"]
+            partner_name = sess["partner_name"]
 
             where_clauses = [
                 "m.ZCHATSESSION = ?",
@@ -782,14 +1022,12 @@ class QueryEngine:
                 params.append(until_epoch - APPLE_EPOCH_OFFSET)
 
             where_sql = " AND ".join(where_clauses)
-            # In incremental_cursor mode (--after-id), advance forward (ASC) from cursor.
-            # In time_window mode (--since), take the most recent `limit` messages (DESC) then sort ASC.
             order_dir = "ASC" if effective_after_id is not None else "DESC"
             sql = f"""
                 SELECT
                     m.Z_PK, m.ZSTANZAID, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
                     m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME, m.ZPARENTMESSAGE,
-                    gm.ZMEMBERJID,
+                    {from_expr}, gm.ZMEMBERJID,
                     mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZAUTHORNAME,
                     mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZFILESIZE,
                     {dur_expr}, mi.ZLATITUDE, mi.ZLONGITUDE, mi.ZMETADATA
@@ -810,14 +1048,16 @@ class QueryEngine:
             if order_dir == "DESC":
                 raw_rows.reverse()
 
-            member_dict = self.get_group_member_prefix_dict(sess_pk)
+            member_dict = self.get_session_member_prefix_dict(sess_pk, chat_id)
             new_messages: list[dict[str, Any]] = []
             for r in raw_rows:
-                item = self._transform_message_row(r, member_dict, is_context_buffer=False)
+                item = self._transform_message_row(
+                    r, sess_pk, chat_id, partner_name, member_dict, is_context_buffer=False
+                )
                 if item is not None:
                     new_messages.append(item)
 
-            if not new_messages and not is_explicit_single_or_multi:
+            if not new_messages and is_wildcard:
                 continue
 
             buffer_messages: list[dict[str, Any]] = []
@@ -827,7 +1067,7 @@ class QueryEngine:
                     SELECT
                         m.Z_PK, m.ZSTANZAID, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
                         m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME, m.ZPARENTMESSAGE,
-                        gm.ZMEMBERJID,
+                        {from_expr}, gm.ZMEMBERJID,
                         mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZAUTHORNAME,
                         mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZFILESIZE,
                         {dur_expr}, mi.ZLATITUDE, mi.ZLONGITUDE, mi.ZMETADATA
@@ -843,7 +1083,9 @@ class QueryEngine:
                 cur.execute(buf_sql, [sess_pk, *EXCLUDED_MSG_TYPES, first_new_pk, ctx_count * 2])
                 buf_rows = cur.fetchall()
                 for r in buf_rows:
-                    item = self._transform_message_row(r, member_dict, is_context_buffer=True)
+                    item = self._transform_message_row(
+                        r, sess_pk, chat_id, partner_name, member_dict, is_context_buffer=True
+                    )
                     if item is not None:
                         buffer_messages.append(item)
                     if len(buffer_messages) >= ctx_count:
@@ -860,8 +1102,6 @@ class QueryEngine:
             )
             chat_overall_latest = int(cur.fetchone()[0] or 0)
 
-            # Sort buffer and new messages chronologically (by timestamp_epoch, then msg_id)
-            # so multi-device history sync messages appear in true conversation order.
             buffer_messages.sort(key=lambda m: (m["timestamp_epoch"], m["msg_id"]))
             new_messages.sort(key=lambda m: (m["timestamp_epoch"], m["msg_id"]))
 
@@ -872,7 +1112,9 @@ class QueryEngine:
             chats_result.append(
                 {
                     "chat_id": chat_id,
-                    "group_name": group_name,
+                    "chat_name": chat_name,
+                    "group_name": chat_name,
+                    "chat_type": sess_type,
                     "chat_min_msg_id": chat_min_id,
                     "chat_latest_msg_id": chat_max_id,
                     "new_message_count": len(new_messages),
@@ -890,6 +1132,7 @@ class QueryEngine:
                 "query_mode": query_mode,
                 "request_after_msg_id": after_msg_id,
                 "global_latest_msg_id": self.snapshot.global_latest_msg_id,
+                "chat_scope": self.config.chat_scope,
                 "my_identity": self.config.my_display_label,
                 "warnings": warnings,
             },
@@ -903,14 +1146,15 @@ class QueryEngine:
         since_str: str | None = None,
         context_window: int = 3,
         limit: int = 50,
+        chat_type: str = "all",
     ) -> dict[str, Any]:
-        """Search messages across allowed groups with +/- N context messages around each hit."""
+        """Search messages across allowed WhatsApp chats with +/- N context messages around each hit."""
         q_clean = (query or "").strip()
         if not q_clean:
             raise UsageError("Search --query cannot be empty.")
 
         target_chats = chat_ids if chat_ids else ["ALL_ALLOWED"]
-        sessions = self._resolve_target_sessions(target_chats)
+        sessions = self._resolve_target_sessions(target_chats, chat_type=chat_type)
         if not sessions:
             return {
                 "meta": {
@@ -928,6 +1172,7 @@ class QueryEngine:
         sess_placeholders = ",".join("?" for _ in sess_map)
         excl_placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
         dur_expr = self._media_duration_expr("mi")
+        from_expr = self._from_jid_expr("m")
 
         where_clauses = [
             f"m.ZCHATSESSION IN ({sess_placeholders})",
@@ -947,7 +1192,7 @@ class QueryEngine:
             SELECT
                 m.Z_PK, m.ZCHATSESSION, m.ZSTANZAID, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
                 m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME, m.ZPARENTMESSAGE,
-                gm.ZMEMBERJID,
+                {from_expr}, gm.ZMEMBERJID,
                 mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZAUTHORNAME,
                 mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZFILESIZE,
                 {dur_expr}, mi.ZLATITUDE, mi.ZLONGITUDE, mi.ZMETADATA
@@ -968,10 +1213,14 @@ class QueryEngine:
         for hit in hit_rows:
             sess_pk = int(hit["ZCHATSESSION"])
             sess_info = sess_map[sess_pk]
-            member_dict = self.get_group_member_prefix_dict(sess_pk)
+            chat_id = sess_info["chat_id"]
+            partner_name = sess_info["partner_name"]
+            member_dict = self.get_session_member_prefix_dict(sess_pk, chat_id)
             hit_pk = int(hit["Z_PK"])
 
-            hit_msg = self._transform_message_row(hit, member_dict, is_context_buffer=False)
+            hit_msg = self._transform_message_row(
+                hit, sess_pk, chat_id, partner_name, member_dict, is_context_buffer=False
+            )
             if hit_msg is None:
                 continue
 
@@ -984,7 +1233,7 @@ class QueryEngine:
                     SELECT
                         m.Z_PK, m.ZSTANZAID, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
                         m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME, m.ZPARENTMESSAGE,
-                        gm.ZMEMBERJID,
+                        {from_expr}, gm.ZMEMBERJID,
                         mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZAUTHORNAME,
                         mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZFILESIZE,
                         {dur_expr}, mi.ZLATITUDE, mi.ZLONGITUDE, mi.ZMETADATA
@@ -997,7 +1246,9 @@ class QueryEngine:
                     [sess_pk, *EXCLUDED_MSG_TYPES, hit_pk, ctx_n],
                 )
                 for r in reversed(cur.fetchall()):
-                    m_obj = self._transform_message_row(r, member_dict, is_context_buffer=True)
+                    m_obj = self._transform_message_row(
+                        r, sess_pk, chat_id, partner_name, member_dict, is_context_buffer=True
+                    )
                     if m_obj:
                         before_msgs.append(m_obj)
 
@@ -1006,7 +1257,7 @@ class QueryEngine:
                     SELECT
                         m.Z_PK, m.ZSTANZAID, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
                         m.ZISFROMME, m.ZTEXT, m.ZPUSHNAME, m.ZPARENTMESSAGE,
-                        gm.ZMEMBERJID,
+                        {from_expr}, gm.ZMEMBERJID,
                         mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZAUTHORNAME,
                         mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZFILESIZE,
                         {dur_expr}, mi.ZLATITUDE, mi.ZLONGITUDE, mi.ZMETADATA
@@ -1019,14 +1270,18 @@ class QueryEngine:
                     [sess_pk, *EXCLUDED_MSG_TYPES, hit_pk, ctx_n],
                 )
                 for r in cur.fetchall():
-                    m_obj = self._transform_message_row(r, member_dict, is_context_buffer=True)
+                    m_obj = self._transform_message_row(
+                        r, sess_pk, chat_id, partner_name, member_dict, is_context_buffer=True
+                    )
                     if m_obj:
                         after_msgs.append(m_obj)
 
             matches.append(
                 {
-                    "chat_id": sess_info["chat_id"],
-                    "group_name": clean_unicode_display_name(sess_info["group_name"]) or "未命名群聊",
+                    "chat_id": chat_id,
+                    "chat_name": sess_info["chat_name"],
+                    "group_name": sess_info["chat_name"],
+                    "chat_type": sess_info["chat_type"],
                     "matched_message": hit_msg,
                     "context_before": before_msgs,
                     "context_after": after_msgs,

@@ -30,21 +30,23 @@ def strip_jid_Namespace(jid: str | None) -> str:
 
 def format_fallback_sender_name(jid: str | None, bridged_phone_jid: str | None = None) -> str:
     """Format anonymized fallback name when contact name and pushname are both empty."""
-    # Prefer phone JID if bridged from LID.sqlite so user sees (+country-last4) instead of opaque LID
     target = bridged_phone_jid if (bridged_phone_jid and bridged_phone_jid.endswith("@s.whatsapp.net")) else jid
     if not target:
-        return "未知群友"
+        return "未知联系人"
     user_part = strip_jid_Namespace(target)
     if target.endswith("@lid"):
         tail = user_part[-4:] if len(user_part) >= 4 else user_part
-        return f"外部群友#{tail}"
+        return f"联系人#{tail}"
+    if target.endswith("@newsletter"):
+        tail = user_part[-4:] if len(user_part) >= 4 else user_part
+        return f"频道#{tail}"
     if target.endswith("@s.whatsapp.net"):
         if len(user_part) >= 6:
             prefix = user_part[:2]
             tail = user_part[-4:]
-            return f"群友(+{prefix}-{tail})"
-        return f"群友({user_part})"
-    return f"群友({user_part[-4:] if len(user_part) >= 4 else user_part})"
+            return f"联系人(+{prefix}-{tail})"
+        return f"联系人({user_part})"
+    return f"联系人({user_part[-4:] if len(user_part) >= 4 else user_part})"
 
 
 def disambiguate_punctuation_name(
@@ -55,7 +57,6 @@ def disambiguate_punctuation_name(
     """If a user's nickname consists purely of punctuation (e.g. '.'), append a short phone/ID tag."""
     if not name:
         return format_fallback_sender_name(jid, bridged_phone_jid)
-    # Check if name contains any letter, digit, CJK character, or emoji symbol
     has_word_or_emoji = any(
         ch.isalnum() or unicodedata.category(ch) in ("Lo", "So") or ord(ch) >= 0x1F000
         for ch in name
@@ -98,7 +99,7 @@ def replace_mentions_with_whitelist(
     config: AppConfig,
     auto_self_prefixes: set[str] | None = None,
 ) -> tuple[str, bool]:
-    """Replace @<jid_digits> in text strictly using the group member dictionary and user identity.
+    """Replace @<jid_digits> in text strictly using known contact/member dictionary and user identity.
 
     Returns (cleaned_text, mentions_me).
     Unrecognized @digits (e.g., order numbers @20261107) are preserved untouched.

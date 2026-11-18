@@ -10,6 +10,16 @@ from .cleaner import fold_consecutive_ack_messages
 from .constants import DEFAULT_LONG_AUDIO_THRESHOLD_SEC
 
 WEEKDAY_CN = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+CHAT_TYPE_LABELS_CN = {
+    "group": "群聊",
+    "direct": "私聊",
+    "newsletter": "频道",
+    "broadcast": "广播",
+}
+
+
+def chat_type_label(chat_type: str | None) -> str:
+    return CHAT_TYPE_LABELS_CN.get(chat_type or "", "会话")
 
 
 def format_human_bytes(num_bytes: int | None) -> str:
@@ -113,7 +123,6 @@ def render_single_message_md(
             media_part = f"[附件: {title} | msg_id: {mid} | local_available: {avail_str}]"
 
     text = (msg.get("text") or "").strip()
-    # Avoid duplicating filename if document text is identical to media title
     if media and media.get("media_type") == "document" and text == media.get("title"):
         body = media_part
     elif text and media_part:
@@ -123,7 +132,6 @@ def render_single_message_md(
     else:
         body = text
 
-    # Normalize multi-line body indentation
     body_lines = body.splitlines()
     if len(body_lines) > 1:
         body = "\n  ".join(body_lines)
@@ -131,27 +139,37 @@ def render_single_message_md(
     return f"[#{mid}] {t_str} [{sender}]{reply_part}: {body}"
 
 
-def format_groups_markdown(data: dict[str, Any]) -> str:
+def format_chats_markdown(data: dict[str, Any]) -> str:
     meta = data.get("meta", {})
-    groups = data.get("groups", [])
+    chats = data.get("chats", data.get("groups", []))
     lines = [
-        "# WhatsApp 本地群聊列表",
+        "# WhatsApp 本地会话列表",
         f"- 快照基准时间: {format_header_datetime(meta.get('snapshot_time'))} (缓存年龄: {meta.get('snapshot_age_sec', 0)}s)",
         f"- 全局最新消息游标 (`global_latest_msg_id`): {meta.get('global_latest_msg_id', 0)}",
-        f"- 当前过滤策略: `{meta.get('filter_mode', 'blacklist')}` | 共返回 {len(groups)} 个群聊",
+        (
+            f"- 当前范围策略 (`chat_scope`): `{meta.get('chat_scope', 'all')}` | "
+            f"过滤模式: `{meta.get('filter_mode', 'blacklist')}` | 共返回 {len(chats)} 个会话"
+        ),
     ]
     for w in meta.get("warnings", []):
         lines.append(f"- [⚠️ 预警 {w.get('code')}]: {w.get('message')}")
     lines.append("")
-    lines.append("| 状态 | 群聊名称 | 群聊 JID (`chat_id`) | 最新游标 (`latest_msg_id`) | 过去24h消息数 | 群成员数 | 最后活跃时间 |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
-    for g in groups:
-        status_icon = "✅ 允许" if g.get("allowed", True) else "🚫 屏蔽"
+    lines.append("| 状态 | 类型 | 会话名称 | 会话 JID (`chat_id`) | 最新游标 (`latest_msg_id`) | 过去24h消息数 | 参与人数 | 最后活跃时间 |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+    for c in chats:
+        status_icon = "✅ 允许" if c.get("allowed", True) else "🚫 屏蔽"
+        cname = c.get("chat_name") or c.get("group_name") or c["chat_id"]
+        ctype_cn = chat_type_label(c.get("chat_type"))
         lines.append(
-            f"| {status_icon} | {g['group_name']} | `{g['chat_id']}` | `{g['latest_msg_id']}` | "
-            f"{g['msg_count_24h']} | {g['member_count']} | {iso_to_short_time(g.get('last_active_time'))} |"
+            f"| {status_icon} | {ctype_cn} | {cname} | `{c['chat_id']}` | `{c['latest_msg_id']}` | "
+            f"{c['msg_count_24h']} | {c['member_count']} | {iso_to_short_time(c.get('last_active_time'))} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def format_groups_markdown(data: dict[str, Any]) -> str:
+    """Backward-compatible renderer for group-filtered listings."""
+    return format_chats_markdown(data)
 
 
 def format_fetch_markdown(
@@ -162,7 +180,7 @@ def format_fetch_markdown(
     meta = data.get("meta", {})
     chats = data.get("chats", [])
     lines = [
-        "# WhatsApp 群聊提取记录",
+        "# WhatsApp 聊天提取记录",
         f"- 数据提取基准时间: {format_header_datetime(meta.get('extracted_at'))}",
         f"- 全局最新游标 (`global_latest_msg_id`): {meta.get('global_latest_msg_id', 0)} | 提取模式: `{meta.get('query_mode')}`",
         f"- 本人身份锚点: `{meta.get('my_identity', '我')}`",
@@ -172,15 +190,17 @@ def format_fetch_markdown(
 
     if not chats:
         lines.append("")
-        lines.append("*(当前时间窗口或增量游标下无新增群聊消息)*")
+        lines.append("*(当前时间窗口或增量游标下无新增聊天消息)*")
         return "\n".join(lines) + "\n"
 
     for chat in chats:
+        cname = chat.get("chat_name") or chat.get("group_name") or chat["chat_id"]
+        ctype_cn = chat_type_label(chat.get("chat_type"))
         lines.append("")
-        lines.append(f"## 群聊: {chat['group_name']} (`{chat['chat_id']}`)")
+        lines.append(f"## [{ctype_cn}] {cname} (`{chat['chat_id']}`)")
         more_flag = " | ⚠️ 仍有更多消息 (`has_more: true`)" if chat.get("has_more") else ""
         lines.append(
-            f"- 本群最新游标 (`chat_latest_msg_id`): {chat['chat_latest_msg_id']} | "
+            f"- 本会话最新游标 (`chat_latest_msg_id`): {chat['chat_latest_msg_id']} | "
             f"新增消息: {chat['new_message_count']} 条 | "
             f"上下文缓冲: {chat['context_buffer_count']} 条{more_flag}"
         )
@@ -188,7 +208,7 @@ def format_fetch_markdown(
 
         raw_msgs = chat.get("messages", [])
         if not raw_msgs:
-            lines.append("*(本群在此窗口内无新增消息)*")
+            lines.append("*(本会话在此窗口内无新增消息)*")
             continue
 
         msgs_to_render = fold_consecutive_ack_messages(raw_msgs) if fold_noise else raw_msgs
@@ -214,7 +234,7 @@ def format_search_markdown(
     meta = data.get("meta", {})
     matches = data.get("matches", [])
     lines = [
-        f"# WhatsApp 跨群检索结果: \"{meta.get('query', '')}\"",
+        f"# WhatsApp 全量会话检索结果: \"{meta.get('query', '')}\"",
         f"- 快照基准时间: {format_header_datetime(meta.get('snapshot_time'))} | 命中条数: {meta.get('match_count', 0)}",
     ]
     for w in meta.get("warnings", []):
@@ -222,14 +242,16 @@ def format_search_markdown(
 
     if not matches:
         lines.append("")
-        lines.append("*(未找到匹配该关键词的群聊消息)*")
+        lines.append("*(未找到匹配该关键词的聊天消息)*")
         return "\n".join(lines) + "\n"
 
     for idx, item in enumerate(matches, 1):
         hit = item["matched_message"]
+        cname = item.get("chat_name") or item.get("group_name") or item["chat_id"]
+        ctype_cn = chat_type_label(item.get("chat_type"))
         lines.append("")
         lines.append(
-            f"### {idx}. [{item['group_name']}] 命中消息 `#{hit['msg_id']}` ({iso_to_short_time(hit.get('timestamp'))})"
+            f"### {idx}. [{ctype_cn}: {cname}] 命中消息 `#{hit['msg_id']}` ({iso_to_short_time(hit.get('timestamp'))})"
         )
         for b in item.get("context_before", []):
             lines.append("  " + render_single_message_md(b, long_audio_threshold_sec))

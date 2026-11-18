@@ -1,18 +1,18 @@
-"""Atomic SQLite online backup (sqlite3_backup), multi-path auto-discovery, and POSIX flock manager."""
+"""Atomic SQLite online backup (sqlite3_backup), multi-path auto-discovery, and file lock manager."""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import shutil
 import sqlite3
+import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
+from typing import Any, Iterator
 
 from .config import AppConfig
 from .constants import APPLE_EPOCH_OFFSET, DEFAULT_WA_CONTAINER_DIR
@@ -49,24 +49,60 @@ def epoch_to_local_iso(epoch_sec: float | int | None) -> str | None:
 
 
 def make_ro_sqlite_uri(db_path: Path) -> str:
-    abs_path = str(db_path.resolve())
-    return f"file:{quote(abs_path, safe='/')}?mode=ro"
+    return f"{db_path.resolve().as_uri()}?mode=ro"
+
+
+def _chmod_best_effort(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _acquire_snapshot_lock(lock_path: Path) -> Iterator[None]:
+    """Cross-platform exclusive file lock (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows)."""
+    lock_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if sys.platform == "win32":
+        import msvcrt
+
+        with open(lock_path, "a+b") as lock_file:
+            if lock_file.tell() == 0:
+                lock_file.write(b" ")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+    else:
+        import fcntl
+
+        with open(lock_path, "w", encoding="utf-8") as lock_file:
+            _chmod_best_effort(lock_path, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def resolve_wa_container_and_db(configured_dir: str) -> tuple[Path, Path]:
     """Resolve WhatsApp container directory and ChatStorage.sqlite across macOS installation variants."""
     primary = Path(os.path.expanduser(configured_dir))
-    # If custom container was explicitly configured (e.g. in tests or custom env), check it first
     for sub in ("ChatStorage.sqlite", "App/ChatStorage.sqlite"):
         cand_db = primary / sub
         try:
             if cand_db.exists():
                 return primary, cand_db
         except PermissionError:
-            # Exists behind TCC; return it so caller gets proper TCC permission diagnostic
             return primary, cand_db
 
-    # If primary is default and not found, probe known macOS WhatsApp container locations
     if primary == DEFAULT_WA_CONTAINER_DIR:
         for cand_str in CANDIDATE_WA_CONTAINERS:
             cdir = Path(os.path.expanduser(cand_str))
@@ -82,7 +118,7 @@ def resolve_wa_container_and_db(configured_dir: str) -> tuple[Path, Path]:
 
 
 class SnapshotManager:
-    """Manages atomic SQLite snapshots with POSIX flock and TTL caching."""
+    """Manages atomic SQLite snapshots with file locking and TTL caching."""
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -100,7 +136,7 @@ class SnapshotManager:
         self.media_dir = self.snapshot_dir / "media"
 
     def check_source_access(self) -> dict[str, Any]:
-        """Inspect source WhatsApp database existence and read permissions for `doctor`."""
+        """Inspect source WhatsApp database existence, read permissions, and session counts for `doctor`."""
         info: dict[str, Any] = {
             "container_dir": str(self.container_dir),
             "container_exists": False,
@@ -128,11 +164,22 @@ class SnapshotManager:
             uri = make_ro_sqlite_uri(self.source_db_path)
             conn = sqlite3.connect(uri, uri=True, timeout=3.0)
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM ZWACHATSESSION WHERE ZCONTACTJID LIKE '%@g.us'")
-            group_count = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN ZCONTACTJID LIKE '%@g.us' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN ZCONTACTJID LIKE '%@s.whatsapp.net' OR ZCONTACTJID LIKE '%@lid' THEN 1 ELSE 0 END)
+                FROM ZWACHATSESSION
+                WHERE ZCONTACTJID IS NOT NULL AND ZCONTACTJID != 'status@broadcast'
+                """
+            )
+            counts_row = cur.fetchone() or (0, 0, 0)
             conn.close()
             info["source_db_readable"] = True
-            info["group_session_count"] = group_count
+            info["total_session_count"] = int(counts_row[0] or 0)
+            info["group_session_count"] = int(counts_row[1] or 0)
+            info["direct_session_count"] = int(counts_row[2] or 0)
         except PermissionError as exc:
             info["error"] = (
                 f"Permission denied reading {self.source_db_path}. "
@@ -149,24 +196,20 @@ class SnapshotManager:
         return info
 
     def ensure_snapshot(self, force_fresh: bool = False) -> SnapshotState:
-        """Ensure a fresh or valid cached snapshot exists using POSIX flock."""
-        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        """Ensure a fresh or valid cached snapshot exists using exclusive file lock."""
+        self.snapshot_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        _chmod_best_effort(self.snapshot_dir, 0o700)
         ttl_sec = max(0, self.config.cleaning.snapshot_ttl_sec)
         now = time.time()
 
         if not force_fresh and self._is_cache_valid(now, ttl_sec):
             return self._load_cached_state(now)
 
-        # Acquire exclusive flock to serialize concurrent snapshot refreshes
-        with open(self.lock_path, "w", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                now = time.time()
-                if not force_fresh and self._is_cache_valid(now, max(1, ttl_sec)):
-                    return self._load_cached_state(now)
-                return self._perform_atomic_backup()
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with _acquire_snapshot_lock(self.lock_path):
+            now = time.time()
+            if not force_fresh and self._is_cache_valid(now, max(1, ttl_sec)):
+                return self._load_cached_state(now)
+            return self._perform_atomic_backup()
 
     def _is_cache_valid(self, now: float, ttl_sec: int) -> bool:
         if not self.snapshot_db_path.exists() or not self.meta_path.exists():
@@ -220,7 +263,9 @@ class SnapshotManager:
             finally:
                 dst_conn.close()
                 src_conn.close()
+            _chmod_best_effort(tmp_path, 0o600)
             tmp_path.replace(dst_path)
+            _chmod_best_effort(dst_path, 0o600)
             return dst_path
         except Exception:
             if tmp_path.exists():
@@ -286,10 +331,10 @@ class SnapshotManager:
                 error_code="SQLITE_BACKUP_FAILED",
             ) from exc
 
-        # Atomic replace of primary ChatStorage snapshot
+        _chmod_best_effort(tmp_db_path, 0o600)
         tmp_db_path.replace(self.snapshot_db_path)
+        _chmod_best_effort(self.snapshot_db_path, 0o600)
 
-        # Backup auxiliary LID.sqlite (merges LID.sqlite-wal for @lid <-> phone number bridging) and ContactsV2.sqlite
         lid_path = self._backup_auxiliary_db(
             self.source_lid_db_path,
             self.snapshot_lid_db_path,
@@ -303,7 +348,6 @@ class SnapshotManager:
             "ContactsV2_snapshot",
         )
 
-        # Query global max Z_PK and latest message timestamp from the new snapshot
         global_latest_msg_id = 0
         db_latest_msg_epoch: int | None = None
         try:
@@ -338,7 +382,9 @@ class SnapshotManager:
         }
         tmp_meta = self.snapshot_dir / f"snapshot_meta.{os.getpid()}.tmp.json"
         tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _chmod_best_effort(tmp_meta, 0o600)
         tmp_meta.replace(self.meta_path)
+        _chmod_best_effort(self.meta_path, 0o600)
 
         return SnapshotState(
             snapshot_db_path=self.snapshot_db_path,
