@@ -6,11 +6,12 @@
     "whatsapp-localmind",
     "wa_localmind",
     "WhatsApp LocalMind CLI & MCP Server",
-    "macOS WhatsApp 本地群聊提取器"
+    "macOS WhatsApp 本地全量聊天提取器"
   ],
-  "description": "Zero-dependency, strictly read-only macOS WhatsApp local group chat (@g.us) extractor, structured cleaner, CLI, and JSON-RPC 2.0 MCP Stdio Server for AI Agents. Uses sqlite3_backup atomic snapshots with POSIX flock and ?mode=ro queries across ChatStorage.sqlite, LID.sqlite, and ContactsV2.sqlite, physically blocking 1-on-1 DMs (@s.whatsapp.net / @lid) and making zero outbound network requests.",
-  "version": "3.2.0",
+  "description": "Zero-dependency, strictly read-only macOS WhatsApp full-account local chat extractor (1-on-1 DMs, groups, channels, broadcast lists), structured cleaner, CLI, and JSON-RPC 2.0 MCP Stdio Server for AI Agents. Uses sqlite3_backup atomic snapshots with POSIX flock and ?mode=ro queries across ChatStorage.sqlite, LID.sqlite, and ContactsV2.sqlite, with optional chat_scope and blacklist/whitelist filtering and zero outbound network requests.",
+  "version": "4.0.0",
   "datePublished": "2026-11-13",
+  "dateModified": "2026-11-18",
   "codeRepository": "https://github.com/qilaidev/whatsapp-localmind",
   "issueTracker": "https://github.com/qilaidev/whatsapp-localmind/issues",
   "url": "https://qilaidav.com/oash/",
@@ -51,20 +52,23 @@
     "privacy",
     "macos",
     "python",
+    "chat-extractor",
+    "direct-messages",
     "group-chat",
-    "WhatsApp群聊提取",
+    "WhatsApp全量聊天提取",
     "macOS WhatsApp 数据库",
     "WhatsApp MCP服务器",
     "本地优先聊天归档"
   ],
   "featureList": [
     "SQLite Online Backup (sqlite3_backup) and POSIX flock atomic snapshots opened strictly via ?mode=ro",
-    "Physical @g.us group-only isolation blocking 1-on-1 @s.whatsapp.net and @lid DMs with EXIT_POLICY_DENIED (3)",
-    "4-tier real-name resolution and @lid cross-table bridging across LID.sqlite, ContactsV2.sqlite, ZWACHATSESSION, ZWAGROUPMEMBER, and ZWAPROFILEPUSHNAME",
+    "Full-account chat extraction across 1-on-1 DMs (@s.whatsapp.net, @lid, bare phone numbers), groups (@g.us), channels (@newsletter), and broadcast lists (excluding status@broadcast)",
+    "Configurable chat_scope (all, groups, direct, newsletter) and blacklist/whitelist policy enforcement with EXIT_POLICY_DENIED (3)",
+    "4-tier real-name resolution and bidirectional @lid <-> @s.whatsapp.net bridging across LID.sqlite, ContactsV2.sqlite, ZWACHATSESSION, ZWAGROUPMEMBER, and ZWAPROFILEPUSHNAME",
     "Pure-Python zero-dependency Protobuf wire parser for ZWAMEDIAITEM.ZMETADATA 150-char reply chains and whitelisted @mentions",
     "Monotonic incremental cursor (--after-id via ZWAMESSAGE.Z_PK) with 10-message context buffer and 24h out-of-bounds fallback",
-    "Reversible short-ack noise folding and on-demand sandboxed media export (.opus, .pdf, .xlsx, images) with path traversal protection",
-    "9 CLI subcommands (+ list-groups alias), 4 read-only JSON-RPC 2.0 MCP Stdio tools, and SKILL.md agent bundle"
+    "Reversible short-ack noise folding and on-demand sandboxed media export (.opus, .pdf, .xlsx, images, videos) with path traversal protection",
+    "10 CLI subcommands (+ list-chats and list-groups aliases), 5 read-only JSON-RPC 2.0 MCP Stdio tools, and SKILL.md agent bundle"
   ],
   "softwareRequirements": [
     "macOS",
